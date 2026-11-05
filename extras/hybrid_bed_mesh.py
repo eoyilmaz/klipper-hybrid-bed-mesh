@@ -48,6 +48,10 @@ logger = logging.getLogger(__name__)
 # BED_MESH_HYBRID_CALIBRATE parameters handed over to the rapid scan pass
 SCAN_PASS_THROUGH = ("ALGORITHM", "MESH_PPS", "HORIZONTAL_MOVE_Z", "SCAN_SPEED")
 
+# the start of the eddy probe's error when it can't find the tap in the data,
+# only these taps are retried
+TAP_ERROR = "Unable to detect tap"
+
 CALIBRATE_HELP = (
     "Rapid scan the bed mesh with the eddy probe and tap the front strip it "
     "can not reach"
@@ -327,14 +331,17 @@ def parse_pair(gcmd: GCodeCommand, name: str, default: Sequence, parser: type) -
     return pair
 
 
-class SettlingProbePointsHelper(ProbePointsHelper):
-    """A ProbePointsHelper that waits for the toolhead to settle before a probe.
+class TapPointsHelper(ProbePointsHelper):
+    """A ProbePointsHelper that lets the toolhead settle and retries failed taps.
 
     Klipper starts the probe as soon as the move to the point ends, a tap
     started while the toolhead still rings from that move triggers in mid-air.
+    A tap can also fail now and then ("Unable to detect tap: ..."), which would
+    otherwise abort the whole mesh, so that point is tapped again.
     """
 
     settle_time: float = 0.0
+    retries: int = 0
 
     def _move_next(self, probe_num: int) -> None:
         """Move to the next point and wait ``settle_time`` seconds.
@@ -345,6 +352,54 @@ class SettlingProbePointsHelper(ProbePointsHelper):
         super()._move_next(probe_num)
         if self.settle_time:
             self.printer.lookup_object("toolhead").dwell(self.settle_time)
+
+    def start_probe(self, gcmd: GCodeCommand) -> None:
+        """Tap every point, retrying a point whose tap couldn't be detected.
+
+        Unlike ``ProbePointsHelper.start_probe`` the results are pulled after
+        each point: a failed tap leaves its error in the eddy probe session, so
+        a retry needs a new session, and ending a session drops its results.
+
+        Args:
+            gcmd (GCodeCommand): The tap command, with ``METHOD=tap``.
+
+        Raises:
+            gcmd.error: If a point still fails after ``retries`` retries.
+        """
+        probe = self.printer.lookup_object("probe")
+        self.horizontal_move_z = gcmd.get_float(
+            "HORIZONTAL_MOVE_Z", self.default_horizontal_move_z
+        )
+        self.lift_speed = probe.get_probe_params(gcmd)["lift_speed"]
+        self.probe_offsets = probe.get_offsets(gcmd)
+        session = probe.start_probe_session(gcmd)
+        results = []
+        for probe_num, (x, y) in enumerate(self.probe_points):
+            for attempt in range(self.retries + 1):
+                self._raise_tool(not probe_num and not attempt)
+                self._move_next(probe_num)
+                try:
+                    session.run_probe(gcmd)
+                except self.printer.command_error as e:
+                    if not str(e).startswith(TAP_ERROR):
+                        raise
+                    if attempt == self.retries:
+                        raise gcmd.error(
+                            f"hybrid_bed_mesh: tap at X{x:.2f} Y{y:.2f} failed "
+                            f"{attempt + 1} times: {e}"
+                        ) from e
+                    gcmd.respond_info(
+                        f"hybrid_bed_mesh: tap at X{x:.2f} Y{y:.2f} failed: {e}, "
+                        f"retrying ({attempt + 1}/{self.retries})"
+                    )
+                    session.end_probe_session()
+                    session = probe.start_probe_session(gcmd)
+                else:
+                    results.extend(session.pull_probed_results())
+                    break
+        self._raise_tool()
+        session.end_probe_session()
+        self.finalize_callback(results)
 
 
 class HybridBedMesh:
@@ -383,6 +438,7 @@ class HybridBedMesh:
         )
         self.tap_probe_speed = config.getfloat("tap_probe_speed", None, above=0.0)
         self.tap_settle_time = config.getfloat("tap_settle_time", 0.5, minval=0.0)
+        self.tap_retries = config.getint("tap_retries", 2, minval=0)
         self.overlap_alignment = config.getchoice(
             "overlap_alignment",
             {name: name for name in OVERLAP_ALIGNMENTS},
@@ -397,7 +453,7 @@ class HybridBedMesh:
         )
         # reads horizontal_move_z and speed from this section, used for the
         # moves between the tapped points
-        self.tap_helper = SettlingProbePointsHelper(
+        self.tap_helper = TapPointsHelper(
             config, self._tap_finalize, default_points=[(0.0, 0.0)]
         )
         self.tap_results: list = []
@@ -750,6 +806,9 @@ class HybridBedMesh:
         )
         self.tap_helper.settle_time = gcmd.get_float(
             "TAP_SETTLE_TIME", self.tap_settle_time, minval=0.0
+        )
+        self.tap_helper.retries = gcmd.get_int(
+            "TAP_RETRIES", self.tap_retries, minval=0
         )
         self.tap_results = []
         self.tap_helper.update_probe_points(points, 1)

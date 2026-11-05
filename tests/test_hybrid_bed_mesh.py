@@ -36,30 +36,21 @@ class FakeZMesh:
 
 
 class FakeProbePointsHelper:
-    instances = []
-
     def __init__(self, config, finalize_callback, default_points=None):
         self.printer = config.get_printer()
         self.finalize_callback = finalize_callback
-        self.points = default_points
-        self.gcmds = []
-        self.surface = None
-        FakeProbePointsHelper.instances.append(self)
+        self.probe_points = default_points
+        self.default_horizontal_move_z = 5.0
 
     def update_probe_points(self, points, min_points):
-        self.points = points
+        self.probe_points = points
+
+    def _raise_tool(self, is_first=False):
+        self.printer.events.append(("raise", is_first))
 
     def _move_next(self, probe_num):
+        self.printer.position = self.probe_points[probe_num]
         self.printer.events.append(("move", probe_num))
-
-    def start_probe(self, gcmd):
-        self.gcmds.append(gcmd)
-        self.finalize_callback(
-            [
-                types.SimpleNamespace(bed_x=x, bed_y=y, bed_z=self.surface(x, y))
-                for x, y in self.points
-            ]
-        )
 
 
 sys.modules.setdefault(
@@ -274,6 +265,51 @@ def surface(x, y):
     return 0.002 * (x - 117.5) ** 2 / 100 - 0.4 * math.exp(-y / 30)
 
 
+class CommandError(Exception):
+    pass
+
+
+class FakeProbe:
+    """The eddy probe, taps the surface at the toolhead position."""
+
+    def __init__(self, printer):
+        self.printer = printer
+        self.surface = surface
+        # tap error messages to raise, per point, before a tap succeeds
+        self.failures = {}
+        self.gcmds = []
+        self.sessions = []
+        self.results = []
+
+    def get_offsets(self, gcmd=None):
+        return (0, 22.245, 0)
+
+    def get_probe_params(self, gcmd=None):
+        return {"lift_speed": 5.0}
+
+    def start_probe_session(self, gcmd):
+        self.gcmds.append(gcmd)
+        self.sessions.append("start")
+        self.results = []
+        return self
+
+    def run_probe(self, gcmd):
+        x, y = self.printer.position
+        errors = self.failures.get((x, y))
+        if errors:
+            raise CommandError(errors.pop(0))
+        self.results.append(
+            types.SimpleNamespace(bed_x=x, bed_y=y, bed_z=self.surface(x, y))
+        )
+
+    def pull_probed_results(self):
+        results, self.results = self.results, []
+        return results
+
+    def end_probe_session(self):
+        self.sessions.append("end")
+
+
 class FakeGcmd:
     def __init__(self, params):
         self.params = params
@@ -371,13 +407,15 @@ class FakePrinter:
         self.objects = {
             "gcode": gcode,
             "bed_mesh": bed_mesh,
-            "probe": types.SimpleNamespace(get_offsets=lambda: (0, 22.245, 0)),
+            "probe": FakeProbe(self),
             "toolhead": types.SimpleNamespace(
                 dwell=lambda delay: self.events.append(("dwell", delay))
             ),
         }
         self.handlers = {}
         self.events = []
+        self.position = None
+        self.command_error = CommandError
 
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
@@ -429,7 +467,6 @@ def hybrid_factory():
         gcode = FakeGcode(bed_mesh, scan_bias)
         printer = FakePrinter(bed_mesh, gcode)
         hybrid = HybridBedMesh(FakeConfig(printer, values))
-        hybrid.tap_helper.surface = surface
         printer.handlers["klippy:connect"]()
         return hybrid, bed_mesh, gcode
 
@@ -452,7 +489,7 @@ def test_calibrate_without_front_strip_only_scans(hybrid_factory) -> None:
     hybrid.cmd_bed_mesh_hybrid_calibrate(gcmd)
     assert len(gcode.scripts) == 1
     assert "MESH_MIN=10.000,24.300" in gcode.scripts[0]
-    assert hybrid.tap_helper.gcmds == []
+    assert hybrid.printer.lookup_object("probe").gcmds == []
 
 
 def test_calibrate_merges_scan_and_tap(hybrid_factory) -> None:
@@ -471,9 +508,9 @@ def test_calibrate_merges_scan_and_tap(hybrid_factory) -> None:
     assert "ALGORITHM=bicubic" in script
 
     # 3 rows x 7 points tapped in a zig-zag, at the nozzle position
-    tap_gcmd = hybrid.tap_helper.gcmds[0]
+    tap_gcmd = hybrid.printer.lookup_object("probe").gcmds[0]
     assert tap_gcmd.params["METHOD"] == "tap"
-    points = hybrid.tap_helper.points
+    points = hybrid.tap_helper.probe_points
     assert len(points) == 21
     assert [p[1] for p in points[::7]] == pytest.approx([5, 16, 27])
     assert points[0][0] < points[6][0]
@@ -525,7 +562,7 @@ def test_calibrate_overlap_alignment(
     hybrid_factory, params, expected_deviation
 ) -> None:
     hybrid, bed_mesh, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
-    hybrid.tap_helper.surface = tilted_surface
+    hybrid.printer.lookup_object("probe").surface = tilted_surface
     gcmd = FakeGcmd(params)
     hybrid.cmd_bed_mesh_hybrid_calibrate(gcmd)
     summary = next(m for m in gcmd.messages if "X slope" in m)
@@ -567,7 +604,7 @@ def test_calibrate_passes_tap_parameters(hybrid_factory) -> None:
             }
         )
     )
-    params = hybrid.tap_helper.gcmds[0].params
+    params = hybrid.printer.lookup_object("probe").gcmds[0].params
     assert params == {
         "METHOD": "tap",
         "SAMPLES": "3",
@@ -581,6 +618,7 @@ def test_taps_wait_for_the_toolhead_to_settle(hybrid_factory) -> None:
     hybrid, _, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
     hybrid.cmd_bed_mesh_hybrid_calibrate(FakeGcmd({}))
     assert hybrid.tap_helper.settle_time == 0.5
+    hybrid.printer.events.clear()
     hybrid.tap_helper._move_next(0)
     assert hybrid.printer.events == [("move", 0), ("dwell", 0.5)]
 
@@ -588,5 +626,52 @@ def test_taps_wait_for_the_toolhead_to_settle(hybrid_factory) -> None:
 def test_tap_settle_time_can_be_turned_off(hybrid_factory) -> None:
     hybrid, _, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
     hybrid.cmd_bed_mesh_hybrid_calibrate(FakeGcmd({"TAP_SETTLE_TIME": "0"}))
+    hybrid.printer.events.clear()
     hybrid.tap_helper._move_next(0)
     assert hybrid.printer.events == [("move", 0)]
+
+
+def test_taps_run_in_one_probe_session(hybrid_factory) -> None:
+    hybrid, _, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
+    hybrid.cmd_bed_mesh_hybrid_calibrate(FakeGcmd({}))
+    probe = hybrid.printer.lookup_object("probe")
+    assert probe.sessions == ["start", "end"]
+    raises = [e for e in hybrid.printer.events if e[0] == "raise"]
+    # one lift before each of the 21 points and one after the last
+    assert raises == [("raise", True)] + [("raise", False)] * 21
+
+
+def test_failed_tap_is_retried_in_a_new_session(hybrid_factory) -> None:
+    hybrid, bed_mesh, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
+    probe = hybrid.printer.lookup_object("probe")
+    probe.failures[(10.0, 5.0)] = [
+        "Unable to detect tap: invalid depress distance "
+        "(0.414508 vs 0.030000:0.250000)"
+    ]
+    gcmd = FakeGcmd({})
+    hybrid.cmd_bed_mesh_hybrid_calibrate(gcmd)
+    assert probe.sessions == ["start", "end", "start", "end"]
+    tap_gcmd = probe.gcmds[0]
+    assert any("retrying (1/2)" in m for m in tap_gcmd.messages)
+    # the point is moved to and tapped again, the mesh is complete
+    moves = [e for e in hybrid.printer.events if e[0] == "move"]
+    assert moves[:2] == [("move", 0), ("move", 0)]
+    assert len(moves) == 22
+    assert bed_mesh.mesh.matrix[0][0] == pytest.approx(surface(10, 5), abs=1e-6)
+
+
+def test_tap_retries_run_out(hybrid_factory) -> None:
+    hybrid, _, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
+    probe = hybrid.printer.lookup_object("probe")
+    probe.failures[(10.0, 5.0)] = ["Unable to detect tap: no contact found"] * 2
+    with pytest.raises(BedMeshError, match="X10.00 Y5.00 failed 2 times"):
+        hybrid.cmd_bed_mesh_hybrid_calibrate(FakeGcmd({"TAP_RETRIES": "1"}))
+
+
+def test_other_probe_errors_are_not_retried(hybrid_factory) -> None:
+    hybrid, _, _ = hybrid_factory(scan_min_y=24.3, mesh_min=(10.0, 5.0))
+    probe = hybrid.printer.lookup_object("probe")
+    probe.failures[(10.0, 5.0)] = ["Must home before probe"]
+    with pytest.raises(CommandError, match="Must home"):
+        hybrid.cmd_bed_mesh_hybrid_calibrate(FakeGcmd({}))
+    assert probe.sessions == ["start"]
