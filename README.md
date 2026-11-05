@@ -86,6 +86,7 @@ part of a slicer start gcode.
 | `tap_sample_retract_dist` | probe default | Lift between the taps of a point. |
 | `tap_probe_speed` | 5 mm/s | Tap speed. `METHOD=tap` ignores the probe's `speed` option. |
 | `tap_settle_time` | 0.5 | Seconds to wait after each move before tapping. A tap that starts while the toolhead still rings from the move can trigger in mid-air. |
+| `tap_retries` | 2 | How many times to tap a point again when its tap can't be detected ("Unable to detect tap: ..."), before the mesh is aborted. |
 | `horizontal_move_z` | 5 | Height the taps start from and travel at. |
 | `speed` | 50 | Travel speed between the taps, in mm/s. |
 | `overlap_alignment` | `linear` | `offset` shifts the tap rows by the average tap − scan difference on the overlap row. `linear` fits a line along X, which also removes an X slope between nozzle and coil. |
@@ -102,7 +103,7 @@ BED_MESH_HYBRID_CALIBRATE [MESH_MIN=x,y] [MESH_MAX=x,y] [PROBE_COUNT=x,y]
     [PROFILE=name] [ALGORITHM=lagrange|bicubic] [MESH_PPS=x,y]
     [HORIZONTAL_MOVE_Z=z] [SCAN_SPEED=v]
     [TAP_SAMPLES=n] [TAP_SAMPLE_RETRACT_DIST=d] [TAP_PROBE_SPEED=v]
-    [TAP_SETTLE_TIME=s] [TAP_HORIZONTAL_MOVE_Z=z]
+    [TAP_SETTLE_TIME=s] [TAP_RETRIES=n] [TAP_HORIZONTAL_MOVE_Z=z]
     [OVERLAP_ALIGNMENT=linear|offset]
 ```
 
